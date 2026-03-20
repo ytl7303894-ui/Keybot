@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 import config
+import qrcode
+from io import BytesIO
 
 # Enable logging
 logging.basicConfig(
@@ -47,18 +49,17 @@ def init_database():
                   first_name TEXT,
                   join_date TEXT,
                   is_admin INTEGER DEFAULT 0,
-                  is_owner INTEGER DEFAULT 0,
-                  balance INTEGER DEFAULT 0)''')
+                  is_owner INTEGER DEFAULT 0)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS keys
                  (key_text TEXT PRIMARY KEY,
-                  user_id INTEGER,
                   duration_days INTEGER,
                   created_at TEXT,
                   expires_at TEXT,
                   is_used INTEGER DEFAULT 0,
                   used_by INTEGER,
-                  used_at TEXT)''')
+                  used_at TEXT,
+                  added_by INTEGER)''')
     
     c.execute('''CREATE TABLE IF NOT EXISTS transactions
                  (txn_id TEXT PRIMARY KEY,
@@ -86,13 +87,15 @@ def init_database():
     default_settings = [
         ('bot_name', 'ONLINE KEY BOT'),
         ('welcome_message', 'Welcome to License Key Bot'),
-        ('payment_details', '💳 *Payment Instructions:*\n\n1️⃣ Send ₹{amount} to this UPI: `{upi_id}`\n2️⃣ Take screenshot of payment\n3️⃣ Click on "I HAVE PAID" button\n4️⃣ Send screenshot for verification'),
-        ('admin_ids', '[]'),
-        ('owner_id', config.DEFAULT_OWNER_ID),
         ('upi_id', config.DEFAULT_UPI_ID),
+        ('upi_name', config.DEFAULT_UPI_NAME),
+        ('qr_code', config.DEFAULT_QR_PATH),
         ('support_username', config.SUPPORT_USERNAME),
         ('channel_link', ''),
-        ('group_link', '')
+        ('group_link', ''),
+        ('admin_ids', '[]'),
+        ('owner_id', config.DEFAULT_OWNER_ID),
+        ('payment_note', '⚠️ *Important:* Send exact amount and share screenshot after payment')
     ]
     
     for key, value in default_settings:
@@ -134,21 +137,14 @@ def add_user(user_id, username, first_name):
     conn.commit()
     conn.close()
 
-def generate_key(duration_days):
-    import uuid
-    import hashlib
-    key = hashlib.md5(f"{uuid.uuid4()}{datetime.now()}".encode()).hexdigest()[:16].upper()
-    return f"{key[:4]}-{key[4:8]}-{key[8:12]}-{key[12:]}"
-
-def save_key(key, duration_days, created_by):
+def add_key(key_text, duration_days, added_by):
     conn = sqlite3.connect('bot_database.db')
     c = conn.cursor()
     expires_at = datetime.now() + timedelta(days=duration_days)
-    c.execute("INSERT INTO keys (key_text, user_id, duration_days, created_at, expires_at) VALUES (?, ?, ?, ?, ?)",
-              (key, created_by, duration_days, datetime.now().isoformat(), expires_at.isoformat()))
+    c.execute("INSERT INTO keys (key_text, duration_days, created_at, expires_at, added_by) VALUES (?, ?, ?, ?, ?)",
+              (key_text, duration_days, datetime.now().isoformat(), expires_at.isoformat(), added_by))
     conn.commit()
     conn.close()
-    return key
 
 def verify_key(key_text):
     conn = sqlite3.connect('bot_database.db')
@@ -209,6 +205,41 @@ def delete_apk(apk_id):
     c.execute("UPDATE apks SET is_active = 0 WHERE apk_id = ?", (apk_id,))
     conn.commit()
     conn.close()
+
+def get_all_keys():
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    c.execute("SELECT key_text, duration_days, created_at, expires_at, is_used, used_by FROM keys ORDER BY created_at DESC")
+    keys = c.fetchall()
+    conn.close()
+    return keys
+
+def delete_key_from_db(key_text):
+    conn = sqlite3.connect('bot_database.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM keys WHERE key_text = ?", (key_text,))
+    affected = c.rowcount
+    conn.commit()
+    conn.close()
+    return affected
+
+# Generate QR Code
+def generate_qr_code(upi_id, amount, name):
+    # UPI QR format: upi://pay?pa=upi_id&pn=name&am=amount&cu=INR
+    upi_url = f"upi://pay?pa={upi_id}&pn={name}&am={amount}&cu=INR"
+    
+    qr = qrcode.QRCode(version=1, box_size=10, border=5)
+    qr.add_data(upi_url)
+    qr.make(fit=True)
+    
+    img = qr.make_image(fill_color="black", back_color="white")
+    
+    # Save to bytes
+    img_bytes = BytesIO()
+    img.save(img_bytes, format='PNG')
+    img_bytes.seek(0)
+    
+    return img_bytes
 
 # Main Menu Keyboard
 def get_main_menu_keyboard(user_id):
@@ -323,22 +354,54 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
         
         upi_id = get_bot_setting('upi_id')
-        payment_details = get_bot_setting('payment_details')
+        upi_name = get_bot_setting('upi_name')
+        payment_note = get_bot_setting('payment_note')
         
-        payment_text = payment_details.format(amount=amount, upi_id=upi_id)
+        # Generate QR code
+        qr_image = generate_qr_code(upi_id, amount, upi_name)
+        
+        payment_text = f"""
+💳 *Payment Details*
+
+💰 *Amount:* ₹{amount}
+📅 *Duration:* {duration_days} days
+🏦 *UPI ID:* `{upi_id}`
+👤 *Account Name:* {upi_name}
+
+{payment_note}
+
+*Steps to Pay:*
+1️⃣ Scan the QR code below
+2️⃣ Pay exactly ₹{amount}
+3️⃣ Take screenshot of payment
+4️⃣ Click "I HAVE PAID" button
+5️⃣ Send screenshot for verification
+"""
         
         keyboard = [
             [InlineKeyboardButton("✅ I HAVE PAID", callback_data="payment_done")],
             [InlineKeyboardButton("🔙 CANCEL", callback_data="buy_license")]
         ]
         
+        # Send QR code with payment info
         await query.edit_message_text(
-            f"{payment_text}\n\n"
-            f"📅 *Duration:* {duration_days} days\n"
-            f"💰 *Amount:* ₹{amount}\n\n"
-            f"⚠️ *After payment, click on 'I HAVE PAID' and send screenshot*",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            payment_text,
             parse_mode='Markdown'
+        )
+        
+        # Send QR code as photo
+        await context.bot.send_photo(
+            chat_id=user.id,
+            photo=qr_image,
+            caption="📱 *Scan this QR code to pay*",
+            parse_mode='Markdown'
+        )
+        
+        # Send buttons after QR code
+        await context.bot.send_message(
+            chat_id=user.id,
+            text="After payment, click the button below:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
         )
     
     elif query.data == "payment_done":
@@ -501,7 +564,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.close()
         
         keyboard = [
-            [InlineKeyboardButton("➕ GENERATE KEY", callback_data="gen_key_menu")],
+            [InlineKeyboardButton("➕ ADD NEW KEY", callback_data="add_key_menu")],
             [InlineKeyboardButton("📊 VIEW ALL KEYS", callback_data="view_keys")],
             [InlineKeyboardButton("🗑️ DELETE KEY", callback_data="delete_key")],
             [InlineKeyboardButton("🔙 BACK", callback_data="admin_panel")]
@@ -518,43 +581,81 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode='Markdown'
         )
     
-    elif query.data == "gen_key_menu":
+    elif query.data == "add_key_menu":
         if not is_admin(user.id):
             return
         
         keyboard = [
-            [InlineKeyboardButton("📦 1 DAY", callback_data="gen_1")],
-            [InlineKeyboardButton("📦 3 DAYS", callback_data="gen_3")],
-            [InlineKeyboardButton("📦 7 DAYS", callback_data="gen_7")],
-            [InlineKeyboardButton("📦 30 DAYS", callback_data="gen_30")],
-            [InlineKeyboardButton("🌟 SEASON (90 DAYS)", callback_data="gen_90")],
+            [InlineKeyboardButton("📦 1 DAY", callback_data="addkey_1")],
+            [InlineKeyboardButton("📦 3 DAYS", callback_data="addkey_3")],
+            [InlineKeyboardButton("📦 7 DAYS", callback_data="addkey_7")],
+            [InlineKeyboardButton("📦 30 DAYS", callback_data="addkey_30")],
+            [InlineKeyboardButton("🌟 SEASON (90 DAYS)", callback_data="addkey_90")],
             [InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]
         ]
         
         await query.edit_message_text(
-            "🔑 *Generate License Key*\n\nSelect duration:",
+            "🔑 *Add License Key*\n\nSelect duration for the key:",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode='Markdown'
         )
     
-    elif query.data.startswith("gen_"):
+    elif query.data.startswith("addkey_"):
         if not is_admin(user.id):
             return
         
-        days = int(query.data.replace("gen_", ""))
-        key = generate_key(days)
-        save_key(key, days, user.id)
-        
-        keyboard = [[InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]]
+        days = int(query.data.replace("addkey_", ""))
+        context.user_data['adding_key'] = {
+            'duration': days,
+            'waiting_for_key': True
+        }
         
         await query.edit_message_text(
-            f"✅ *Key Generated Successfully!*\n\n"
-            f"🔑 *Key:* `{key}`\n"
-            f"📅 *Duration:* {days} days\n"
-            f"👤 *Generated By:* {user.first_name}\n"
-            f"🕐 *Time:* {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-            f"Send this key to the user.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
+            f"🔑 *Add License Key*\n\n"
+            f"📅 *Duration:* {days} days\n\n"
+            f"Please enter the license key to add.\n\n"
+            f"Format: `XXXX-XXXX-XXXX-XXXX`\n\n"
+            f"Example: `ABCD-1234-EFGH-5678`\n\n"
+            f"Or enter multiple keys (one per line):\n"
+            f"`ABCD-1234-EFGH-5678`\n"
+            f"`WXYZ-5678-ABCD-1234`",
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == "view_keys":
+        if not is_admin(user.id):
+            return
+        
+        keys = get_all_keys()
+        
+        if not keys:
+            await query.edit_message_text("No keys found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]]))
+            return
+        
+        key_list = "🔑 *All Keys:*\n\n"
+        for key in keys[:20]:  # Show last 20 keys
+            key_text, duration, created, expires, is_used, used_by = key
+            status = "✅ Used" if is_used else "🆕 Available"
+            key_list += f"🔑 `{key_text}`\n📅 {duration} days\n📊 {status}\n🕐 Added: {created[:10]}\n\n"
+        
+        if len(keys) > 20:
+            key_list += f"\n*Showing 20 of {len(keys)} keys*"
+        
+        await query.edit_message_text(
+            key_list,
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]]),
+            parse_mode='Markdown'
+        )
+    
+    elif query.data == "delete_key":
+        if not is_admin(user.id):
+            return
+        
+        context.user_data['deleting_key'] = True
+        await query.edit_message_text(
+            "🗑️ *Delete License Key*\n\n"
+            "Please send the license key you want to delete.\n\n"
+            "Format: `XXXX-XXXX-XXXX-XXXX`",
             parse_mode='Markdown'
         )
     
@@ -688,11 +789,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
             [InlineKeyboardButton("🏷️ CHANGE BOT NAME", callback_data="set_bot_name")],
             [InlineKeyboardButton("💬 CHANGE WELCOME MSG", callback_data="set_welcome")],
-            [InlineKeyboardButton("💳 CHANGE PAYMENT DETAILS", callback_data="set_payment")],
             [InlineKeyboardButton("💰 CHANGE UPI ID", callback_data="set_upi")],
+            [InlineKeyboardButton("👤 CHANGE UPI NAME", callback_data="set_upi_name")],
             [InlineKeyboardButton("📞 CHANGE SUPPORT USERNAME", callback_data="set_support")],
             [InlineKeyboardButton("📢 CHANGE CHANNEL LINK", callback_data="set_channel")],
             [InlineKeyboardButton("💬 CHANGE GROUP LINK", callback_data="set_group")],
+            [InlineKeyboardButton("📝 CHANGE PAYMENT NOTE", callback_data="set_payment_note")],
             [InlineKeyboardButton("🔙 BACK", callback_data="admin_panel")]
         ]
         
@@ -727,7 +829,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             f"📊 *Bot Statistics*\n\n"
             f"👥 *Users:* {total_users}\n"
-            f"🔑 *Keys Generated:* {total_keys}\n"
+            f"🔑 *Keys Added:* {total_keys}\n"
             f"✓ *Keys Used:* {used_keys}\n"
             f"💰 *Total Revenue:* ₹{revenue}\n"
             f"⏳ *Pending Payments:* {pending}\n"
@@ -784,11 +886,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         prompts = {
             'bot_name': "📝 Enter new bot name:",
             'welcome': "💬 Enter new welcome message:",
-            'payment': "💳 Enter new payment instructions (use {amount} and {upi_id} as placeholders):",
             'upi': "💰 Enter new UPI ID:",
+            'upi_name': "👤 Enter new UPI account name:",
             'support': "📞 Enter support username (without @):",
             'channel': "📢 Enter channel link:",
-            'group': "💬 Enter group link:"
+            'group': "💬 Enter group link:",
+            'payment_note': "📝 Enter new payment note:"
         }
         
         await query.edit_message_text(
@@ -818,32 +921,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             user_list,
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 BACK", callback_data="admin_users")]]),
-            parse_mode='Markdown'
-        )
-    
-    elif query.data == "view_keys":
-        if not is_admin(user.id):
-            return
-        
-        conn = sqlite3.connect('bot_database.db')
-        c = conn.cursor()
-        c.execute("SELECT key_text, duration_days, created_at, is_used, used_by FROM keys ORDER BY created_at DESC LIMIT 20")
-        keys = c.fetchall()
-        conn.close()
-        
-        if not keys:
-            await query.edit_message_text("No keys found.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]]))
-            return
-        
-        key_list = "🔑 *Recent Keys:*\n\n"
-        for k in keys:
-            key_text, duration, created, is_used, used_by = k
-            status = "✅ Used" if is_used else "🆕 Available"
-            key_list += f"🔑 `{key_text}`\n📅 {duration} days\n📊 {status}\n🕐 {created[:10]}\n\n"
-        
-        await query.edit_message_text(
-            key_list,
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 BACK", callback_data="admin_keys")]]),
             parse_mode='Markdown'
         )
     
@@ -920,26 +997,41 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if txn:
             user_id, amount, duration_days = txn
             
-            key = generate_key(duration_days)
-            save_key(key, duration_days, user_id)
+            # Check if we have any keys available for this duration
+            conn2 = sqlite3.connect('bot_database.db')
+            c2 = conn2.cursor()
+            c2.execute("SELECT key_text FROM keys WHERE duration_days = ? AND is_used = 0 AND datetime(expires_at) > datetime('now') LIMIT 1", (duration_days,))
+            available_key = c2.fetchone()
             
-            c.execute("UPDATE transactions SET status = 'completed' WHERE txn_id = ?", (txn_id,))
-            conn.commit()
-            conn.close()
-            
-            # Send key to user
-            await context.bot.send_message(
-                user_id,
-                f"✅ *Payment Verified!*\n\n"
-                f"🔑 *Your License Key:* `{key}`\n"
-                f"📅 *Valid for:* {duration_days} days\n\n"
-                f"Use this key with the *ACTIVATE KEY* option.\n\n"
-                f"Thank you for your purchase! 🎉",
-                parse_mode='Markdown',
-                reply_markup=get_main_menu_keyboard(user_id)
-            )
-            
-            await query.edit_message_text(f"✅ Payment verified! Key sent to user.")
+            if available_key:
+                key = available_key[0]
+                c2.execute("UPDATE keys SET is_used = 1, used_by = ?, used_at = ? WHERE key_text = ?",
+                          (user_id, datetime.now().isoformat(), key))
+                conn2.commit()
+                conn2.close()
+                
+                c.execute("UPDATE transactions SET status = 'completed' WHERE txn_id = ?", (txn_id,))
+                conn.commit()
+                conn.close()
+                
+                # Send key to user
+                await context.bot.send_message(
+                    user_id,
+                    f"✅ *Payment Verified!*\n\n"
+                    f"🔑 *Your License Key:* `{key}`\n"
+                    f"📅 *Valid for:* {duration_days} days\n\n"
+                    f"Use this key with the *ACTIVATE KEY* option.\n\n"
+                    f"Thank you for your purchase! 🎉",
+                    parse_mode='Markdown',
+                    reply_markup=get_main_menu_keyboard(user_id)
+                )
+                
+                await query.edit_message_text(f"✅ Payment verified! Key sent to user.")
+            else:
+                conn2.close()
+                await query.edit_message_text(f"❌ No keys available for {duration_days} days! Please add keys first.")
+        
+        conn.close()
     
     elif query.data.startswith("reject_"):
         if not is_admin(user.id):
@@ -967,18 +1059,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             
             await query.edit_message_text(f"❌ Payment rejected.")
-    
-    elif query.data == "delete_key":
-        if not is_admin(user.id):
-            return
-        
-        context.user_data['deleting_key'] = True
-        await query.edit_message_text(
-            "🗑️ *Delete License Key*\n\n"
-            "Please send the license key you want to delete.\n\n"
-            "Format: `XXXX-XXXX-XXXX-XXXX`",
-            parse_mode='Markdown'
-        )
     
     elif query.data == "all_txns":
         if not is_admin(user.id):
@@ -1014,11 +1094,12 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         default_settings = {
             'bot_name': 'ONLINE KEY BOT',
             'welcome_message': 'Welcome to License Key Bot',
-            'payment_details': '💳 *Payment Instructions:*\n\n1️⃣ Send ₹{amount} to this UPI: `{upi_id}`\n2️⃣ Take screenshot of payment\n3️⃣ Click on "I HAVE PAID" button\n4️⃣ Send screenshot for verification',
             'upi_id': config.DEFAULT_UPI_ID,
+            'upi_name': config.DEFAULT_UPI_NAME,
             'support_username': config.SUPPORT_USERNAME,
             'channel_link': '',
-            'group_link': ''
+            'group_link': '',
+            'payment_note': '⚠️ *Important:* Send exact amount and share screenshot after payment'
         }
         
         for key, value in default_settings.items():
@@ -1052,7 +1133,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle key activation
     if context.user_data.get('activating_key'):
-        if '-' in message_text and len(message_text) == 19:  # XXXX-XXXX-XXXX-XXXX format
+        if '-' in message_text and len(message_text) >= 19:  # XXXX-XXXX-XXXX-XXXX format
             success, result = verify_key(message_text)
             
             if success:
@@ -1080,6 +1161,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         
         context.user_data['activating_key'] = False
+    
+    # Handle adding multiple keys
+    elif context.user_data.get('adding_key', {}).get('waiting_for_key'):
+        duration = context.user_data['adding_key']['duration']
+        keys = message_text.strip().split('\n')
+        added_count = 0
+        
+        for key_text in keys:
+            key_text = key_text.strip().upper()
+            if '-' in key_text and len(key_text) >= 19:
+                try:
+                    add_key(key_text, duration, user.id)
+                    added_count += 1
+                except sqlite3.IntegrityError:
+                    await update.message.reply_text(f"❌ Key `{key_text}` already exists!", parse_mode='Markdown')
+            else:
+                await update.message.reply_text(f"❌ Invalid key format: `{key_text}`\nUse format: XXXX-XXXX-XXXX-XXXX", parse_mode='Markdown')
+        
+        if added_count > 0:
+            await update.message.reply_text(
+                f"✅ *Added {added_count} key(s) successfully!*\n\n"
+                f"📅 Duration: {duration} days\n"
+                f"🔑 Keys added: {added_count}",
+                parse_mode='Markdown'
+            )
+        
+        context.user_data['adding_key'] = None
     
     # Handle APK addition
     elif context.user_data.get('adding_apk'):
@@ -1177,11 +1285,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         setting_names = {
             'bot_name': 'Bot Name',
             'welcome': 'Welcome Message',
-            'payment': 'Payment Instructions',
             'upi': 'UPI ID',
+            'upi_name': 'UPI Account Name',
             'support': 'Support Username',
             'channel': 'Channel Link',
-            'group': 'Group Link'
+            'group': 'Group Link',
+            'payment_note': 'Payment Note'
         }
         
         await update.message.reply_text(
@@ -1194,12 +1303,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # Handle key deletion
     elif context.user_data.get('deleting_key'):
-        conn = sqlite3.connect('bot_database.db')
-        c = conn.cursor()
-        c.execute("DELETE FROM keys WHERE key_text = ?", (message_text,))
-        affected = c.rowcount
-        conn.commit()
-        conn.close()
+        affected = delete_key_from_db(message_text)
         
         if affected > 0:
             await update.message.reply_text(f"✅ Key `{message_text}` has been deleted.", parse_mode='Markdown')
@@ -1296,8 +1400,6 @@ def main():
     
     # Add handlers
     application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("users", list_users))
-    application.add_handler(CommandHandler("transactions", list_transactions))
     application.add_handler(CallbackQueryHandler(button_handler))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     application.add_handler(MessageHandler(filters.PHOTO, handle_message))
@@ -1305,51 +1407,6 @@ def main():
     
     logger.info(f"Bot @{BOT_ID} started successfully!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
-
-async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access Denied!")
-        return
-    
-    conn = sqlite3.connect('bot_database.db')
-    c = conn.cursor()
-    c.execute("SELECT user_id, username, first_name, join_date FROM users ORDER BY join_date DESC LIMIT 30")
-    users = c.fetchall()
-    conn.close()
-    
-    if not users:
-        await update.message.reply_text("No users found.")
-        return
-    
-    user_list = "👥 *User List:*\n\n"
-    for user in users:
-        user_id, username, name, join_date = user
-        user_list += f"🆔 `{user_id}`\n👤 {name}\n📱 @{username or 'N/A'}\n📅 {join_date[:10]}\n\n"
-    
-    await update.message.reply_text(user_list, parse_mode='Markdown')
-
-async def list_transactions(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
-        await update.message.reply_text("❌ Access Denied!")
-        return
-    
-    conn = sqlite3.connect('bot_database.db')
-    c = conn.cursor()
-    c.execute("SELECT txn_id, user_id, amount, status, created_at FROM transactions ORDER BY created_at DESC LIMIT 20")
-    transactions = c.fetchall()
-    conn.close()
-    
-    if not transactions:
-        await update.message.reply_text("No transactions found.")
-        return
-    
-    txn_list = "💰 *Transaction List:*\n\n"
-    for txn in transactions:
-        txn_id, user_id, amount, status, created = txn
-        status_emoji = "✅" if status == "completed" else "⏳" if status == "pending" else "❌"
-        txn_list += f"{status_emoji} `{txn_id[:15]}`\n👤 `{user_id}`\n💰 ₹{amount}\n🕐 {created[:10]}\n\n"
-    
-    await update.message.reply_text(txn_list, parse_mode='Markdown')
 
 if __name__ == '__main__':
     main()
